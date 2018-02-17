@@ -1,0 +1,360 @@
+---
+title: "Data Mining Project"
+author: "Rishika Dhody"
+date: "December 22, 2017"
+output: html_document
+---
+
+## Final Project: Classifying jobs based on descriptions. 
+
+# Problem Statement
+I have a dataset comprising of job descriptions. These jobs correspond to either beginner-level positions or positions requiring a high-level of experience. Classifying a job as __Beginner__ or __Experienced__ based on the job description is a partly subjective process. Some descriptions clearly state the amount of prior experience required, others clearly use words such as _junior_ or _senior_ in the descriptions, still others use words such as _familiar with_ instead of _experienced with_ to indicate that a position is for a relatively junior position.
+
+Reading every job description and determining its classification can be a tedious process. The goal of this project is to find a classification model which can determine if a position is for an _experienced_ or _beginner_ candidate, based on the job description. A model is evaluated by the number of __correct classifications__.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tidyr)
+library(readxl)
+library(knitr)
+library(tm)
+library(Matrix)
+library(caret)
+library(randomForest)
+library(tree)
+library(bartMachine)
+library(gbm)
+library(nnet)
+library(e1071)
+library(pls)
+library(MASS)
+library(glmpath)
+library(rgenoud)
+library(plsRglm)
+
+set.seed(71449)
+```
+
+
+I created this dataset when examining gender bias in the technology labor market. For this project, I start with a file containing the names of the job description files along with other information such as the gender of the applicant and the location of the job. These attributes are not relevant in the current context, since the goal of this project is to classify the job _before_ applying to it. One could argue that the location of the job could be a contributing factor in the classification of interest however, this dataset was constructed with an equal number of Beginner and Experienced jobs for each city. Thus, reducing the significance of the location.
+
+There are only __two__ variables of interest from the original file - __Experience_Level__ and __Description__ (name of the file). 
+
+In the next few lines of code, I create a subset from the original data file. This subset comprises of entries which _have_ a valid file associated with them. I use the files to create a corpus.  
+
+# Setup
+
+Include the Final Project.Rmd file, Data Mining.xlsx file and the Job Descriptions.zip folder in the working directory.
+
+```{r}
+data <- read_excel("Data Mining.xlsx")
+unzip("Job Descriptions.zip")
+
+data <- data[, c("Description", "Experience_Level", "Valid")]
+
+# Not all entries have a valid description file
+data <- filter(data, Valid == "Y")
+data$file_exists <- sapply(data$Description, function(x) {
+                      file_name <- paste("Job Descriptions", x, sep = "/")
+                      file.exists(file_name)
+                     })
+
+complete_data <- filter(data, file_exists == TRUE)
+corpus.raw <- Corpus(DirSource(directory = "Job Descriptions"))
+
+```
+
+Cleaning up the corpus and creating the document term matrix. 
+
+An initial look at the corpus revealed some garbled words. Since the job descriptions were copied from HTML pages into rtf files, some formatting related text such as listid, fonttblffswissfcharset is found in the files. This text appears quite regularly throughout the files. 
+
+It could be possible that experienced job descriptions contain more bullet points, making HTML formatting text a contender as a valid independent variable. I tried the models both with and without the garbled words. I found that models performed marginally better without the garbled words. Therefore, I chose to remove them from the corpus.
+
+Along with the stem words from the document term matrix at a sparsity of 0.7, I included the overall wordcount of the files as one of the independent variables.
+
+```{r}
+corpus <- tm_map(corpus.raw, content_transformer(tolower))
+corpus <- tm_map(corpus, stripWhitespace) 
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+corpus <- tm_map(corpus, stemDocument)
+corpus <- tm_map(corpus, removeWords, c("deftab", "expndexpndtwkern", "marglmargrviewwviewhviewkind", "outlstrokewidth", "rtfansiansicpgcocoartfcocoasubrtf","strokec", "discleveltextleveltemplateiducu","kerningexpndexpndtw", "listtext", "listtablelistlisttemplateidlisthybridlistlevellevelnfclevelnfcnleveljcleveljcnlevelfollowlevelstartatlevelspacelevelindentlevelmark", "listnam", "listid", "levelnumbersfililin", "discleveltextleveltemplateiducu","listlisttemplateidlisthybridlistlevellevelnfclevelnfcnleveljcleveljcnlevelfollowlevelstartatlevelspacelevelindentlevelmark", "pardpardeftabslsa", "lsilvlcf", "colortblredgreenblueredgreenblueredgreenblu", "lsilvlcb", "ffs", "fbfs", "pardpardeftab", "fonttblffswissfcharset", "ucu","pardtxtxpardeftablifislsa", "listoverridetablelistoverridelistidlistoverridecountlslistoverridelistidlistoverridecountlslistoverridelistidlistoverridecountl"))
+
+dtm <- DocumentTermMatrix(corpus)
+dtms <- removeSparseTerms(dtm, sparse = 0.7)
+
+dtm_tfidf <- weightTfIdf(dtms)
+dtm_tfidf_mat  <- as.matrix(dtm_tfidf)
+dtm_df <- as.data.frame(dtm_tfidf_mat)
+dtm_df$word_count <- rowSums(as.matrix(dtm_df))
+
+dtm_df$Description <- rownames(dtm_df)
+```
+
+Creating and formatting complete data set.
+
+```{r}
+# merge two data frames by description
+complete_df <- merge(dtm_df, complete_data, by = "Description")
+rownames(complete_df) <- complete_df$Description
+
+remove_cols <- names(complete_df) %in% c("file_exists", "Description", "Location", "Valid", "Age", "time_sum", "Response", "Gender")
+complete_df <- complete_df[!remove_cols]
+
+complete_df$Experience_Level <- as.factor(complete_df$Experience_Level)
+```
+
+Splitting into testing and training. Creating multiple training and testing datasets. One including all the variables, another excluding the dependent variable and another converting the dependent variable from a factor to a number (0, 1). To be used for the PLSR model.
+
+```{r}
+in_train <- createDataPartition(y = complete_df$Experience_Level, p = 3 / 4, list = FALSE)
+training_data <- complete_df[ in_train, ]
+testing_data  <- complete_df[-in_train, ]
+
+remove_dependent_var <- names(training_data) %in% c("Experience_Level")
+training_data_bart <- training_data[!remove_dependent_var]
+
+remove_dependent_var <- names(testing_data) %in% c("Experience_Level")
+testing_data_bart <- testing_data[!remove_dependent_var]
+
+training_data_pls <- training_data
+training_data_pls$Experience_Level <- sapply(training_data_pls$Experience_Level, function(x){
+  if(x == "Beginner"){
+    return(0)
+  }
+  else{
+    return(1)
+  }
+})
+training_dataX_pls <- training_data_pls[!(names(training_data_pls) %in% c("Experience_Level"))]
+
+testing_data_pls <- testing_data
+testing_data_pls$Experience_Level <- sapply(testing_data_pls$Experience_Level, function(x){
+  if(x == "Beginner"){
+    return(0)
+  }
+  else{
+    return(1)
+  }
+})
+testing_dataX_pls <- testing_data_pls[!(names(testing_data_pls) %in% c("Experience_Level"))]
+
+# Creating data frame to store the results
+results <- data.frame()
+```
+
+# Logit Model
+
+Trying a logit regression, first with all the variables. Without any interactions. The additional word_count field does not appear to contribute to be a significant variable.
+
+```{r}
+logit <- glm(Experience_Level ~ .,
+             data = training_data, family = binomial(link = "logit"))
+logit$coefficients
+y_hat_logit <- predict(logit, newdata = testing_data, type = "response") 
+z_logit <- as.integer(y_hat_logit > 0.5) 
+
+results <- data.frame(model = "logit - additive model", results = mean((testing_data$Experience_Level == "Experienced") == (predict(logit, newdata = testing_data, type = "response") > 0.5)))
+
+kable(table(testing_data$Experience_Level, z_logit), caption = "Logit Confusion Matrix")
+
+```
+
+Trying a logit regression, with interaction variables. Adding interaction variables does not seem to improve/ change the logit results.
+
+```{r}
+logit_inter_var <- glm(Experience_Level ~ (.) ^ 2 + I(abil^2) + I(agil^2) + I(applic ^ 2) + I(build ^ 2) + I(can ^ 2) + I(code ^ 2) + I(collabor ^ 2) + I(complex ^ 2) + I(comput ^ 2) + I(continu ^ 2) + I(data ^ 2) + I(deliv ^ 2) + I(design ^ 2) + I(develop ^ 2) + I(engin ^ 2) + I(experi ^ 2) + I(help ^ 2) + I(high ^ 2) + I(look ^ 2) + I(problem ^ 2) + I(relat ^ 2) + I(relat ^ 2) + I(respons ^ 2) + I(scienc ^ 2) + I(softwar ^ 2) + I(solut ^ 2) + I(solv ^ 2) + I(system ^ 2) + I(team ^ 2) + I(technic ^ 2) + I(technolog ^ 2)+ I(test ^ 2) + I(time ^ 2) + I(understand ^ 2) + I(will ^ 2) + I(work ^ 2) + I(year ^ 2) + I(benefit ^ 2) + I(busi ^ 2) + I(communic ^ 2) + I(compani ^ 2) + I(degre ^ 2) + I(employ ^ 2) + I(environ ^ 2) + I(excel ^ 2) + I(great ^ 2) + I(great ^ 2) + I(great ^ 2) + I(grow ^ 2) +  I(includ ^ 2) + I(integr ^ 2) + I(learn ^ 2) + I(manag ^ 2) + I(new ^ 2) + I(one ^ 2) + I(orient ^ 2) + I(passion ^ 2) + I(peopl ^ 2) + I(perform ^ 2) + I(plan ^ 2) + I(practic ^ 2) + I(product ^ 2) + I(project ^ 2) + I(provid ^ 2) + I(qualiti ^ 2) + I(requir ^ 2) + I(role ^ 2) + I(skill ^ 2) + I(strong ^ 2) +  I(tool ^ 2) + I(across ^ 2) + I(base ^ 2) + I(challeng ^ 2) + I(creat ^ 2) + I(cultur ^ 2) + I(custom ^ 2) + I(deploy ^ 2) + I(featur ^ 2) + I(industri ^ 2) + I(javascript ^ 2) + I(knowledg ^ 2) + I(languag ^ 2) + I(need ^ 2) + I(opportun ^ 2) + I(organ ^ 2) + I(platform ^ 2) + I(process ^ 2) + I(support ^ 2) + I(world ^ 2) + I(best ^ 2) + I(framework ^ 2) + I(java ^ 2) + I(join ^ 2) + I(join ^ 2) + I(lead ^ 2) + I(make ^ 2) + I(use ^ 2) + I(way ^ 2) + I(web ^ 2) + I(also ^ 2) + I(architectur ^ 2) + I(improv ^ 2) + I(mentor ^2) + I(part ^ 2) + I(program ^ 2) + I(scale ^ 2) + I(servic ^ 2) + I(take ^ 2) + I(like ^ 2) + I(user ^ 2) + I(well ^ 2) + I(innov ^ 2) + I(implement ^ 2) + I(youll ^ 2) + I(success ^ 2) + I(word_count ^ 2), data = training_data, family = binomial(link = "logit"))
+
+logit_inter_var$coefficients
+y_hat_logit_var <- predict(logit_inter_var, newdata = testing_data, type = "response") 
+z_logit_var <- as.integer(y_hat_logit_var > 0.5) 
+
+results <- rbind(results, data.frame(model = "logit - model with variable interaction", results = mean((testing_data$Experience_Level == "Experienced") == (predict(logit_inter_var, newdata = testing_data, type = "response") > 0.5))))
+
+kable(table(testing_data$Experience_Level, z_logit_var), caption = "Logit with interaction Confusion Matrix")
+```
+
+# Linear Discriminant Analysis (LDA) Model
+
+```{r}
+LDA <- lda(Experience_Level ~ . , data = training_data)
+y_hat_LDA <- predict(LDA, newdata = testing_data)
+z_LDA <- y_hat_LDA$class
+
+results <- rbind(results, data.frame(model = "LDA", results = mean(testing_data$Experience_Level == z_LDA)))
+kable(table(testing_data$Experience_Level, z_LDA), caption = "LDA Confusion Matrix")
+```
+
+# Glmpath
+
+```{r}
+X <- model.matrix(logit)
+y <- training_data$Experience_Level
+
+path_glm <- glmpath(X, y == "Experienced", nopenalty.subset = 1, family = binomial(link = "logit"))
+summary(path_glm)
+```
+
+```{r}
+new_X <- model.matrix(logit, data = testing_data)
+y_hat_path1 <- predict(path_glm, newx = new_X, type = "response", s = 125) 
+z_path1 <- as.integer(y_hat_path1 > 0.5)
+
+results <- rbind(results, data.frame(model = "Glmpath", results = mean((testing_data$Experience_Level == "Experienced") == 
+                                                                         (z_path1))))
+kable(table(testing_data$Experience_Level, z_path1), caption = "Glmpath Confusion Matrix")
+```
+
+# Rgenoud
+
+```{r}
+ll <- function(beta) {
+  eta <- X %*% beta
+  p <- 1 / (1 + exp(-eta))
+  return( sum(dbinom(y == "yes", size = 1, prob = p, log = TRUE)) )
+}
+rgenoud <- genoud(fn = ll, nvars = ncol(X), max = TRUE,  print.level = 0)
+y_hat_rgenoud <- rgenoud$par %*% t(new_X)
+z_rgenoud <- as.integer(y_hat_rgenoud > 0.5)
+
+results <- rbind(results, data.frame(model = "Rgenoud", results = mean((testing_data$Experience_Level == "Experienced") 
+                                                                       == (z_rgenoud))))
+kable(table(testing_data$Experience_Level, z_path1), caption = "Rgenoud Confusion Matrix")
+
+```
+
+# PLSR Model
+
+Trying a PLSR Model with cross validation
+
+```{r}
+plsr <- plsR(dataY = training_data_pls$Experience_Level, dataX = training_dataX_pls, MClassed = TRUE, typeVC="standard")
+y_hat_pls <- predict(plsr, newdata = testing_dataX_pls, type = "response")
+
+z_pls <- as.integer(y_hat_pls > 0.5) # these are classifications
+
+results <- rbind(results, data.frame(model = "PLSR", results = mean((testing_data$Experience_Level == "Experienced") == (z_pls))))
+kable(table(testing_data_pls$Experience_Level, z_pls), caption = "PLSR Confusion Matrix")
+```
+
+# Trees
+
+Trying a single tree, limited to 4 branches (based on trying upto 20 branches) to avoid over-fitting the data.
+
+```{r}
+out <- tree(Experience_Level ~ ., data = training_data)
+best_model <- prune.tree(out, best = 4)
+plot(best_model)
+text(best_model, pretty = 0)
+
+predictions <- predict(best_model, newdata = testing_data, type = "class")
+results <- rbind(results, data.frame(model = "Single Tree", results = mean(testing_data$Experience_Level == (predictions))))
+kable(table(testing_data$Experience_Level, predictions), caption = "Single tree with pruning Confusion Matrix")
+```
+
+# Bagging Model
+
+Trying the bagging model
+
+```{r}
+bagged <- randomForest(Experience_Level ~ ., data = training_data, 
+                       mtr_y = ncol(training_data) - 1, importance = TRUE)
+varImpPlot(bagged)
+exp_hat_bagged <- predict(bagged, newdata = testing_data, type = "class") 
+results <- rbind(results, data.frame(model = "Bagging", results = mean(testing_data$Experience_Level == (exp_hat_bagged))))
+kable(table(testing_data$Experience_Level, exp_hat_bagged), caption = "Bagging Confusion Matrix")
+```
+
+# Random Forest
+
+Trying Random Forest
+
+```{r}
+rf <- randomForest(Experience_Level ~ ., data = training_data, importance = TRUE)
+varImpPlot(bagged)
+exp_hat_rf <- predict(rf, newdata = testing_data, type = "class") 
+results <- rbind(results, data.frame(model = "Random Forest", results = mean(testing_data$Experience_Level == (exp_hat_rf))))
+kable(table(testing_data$Experience_Level, exp_hat_rf), caption = "Random Forest Confusion Matrix")
+```
+
+# Trying Bart Machine
+
+Implementing classification using bayesian methods
+
+```{r}
+set_bart_machine_num_cores(parallel::detectCores())
+
+bart <- bartMachine(X = training_data_bart, y = training_data$Experience_Level)
+predictions_bart <- predict(bart, new_data = testing_data_bart, type = "class")
+results <- rbind(results, data.frame(model = "Bart Machine", results = mean(testing_data$Experience_Level == (predictions_bart))))
+kable(table(testing_data$Experience_Level, predictions_bart), caption = "Bart Machine Confusion Matrix")
+
+```
+
+# Boosting
+
+Using the boosting model, assuming an additive model and the default shrinkage. 
+
+```{r}
+boosted <- gbm(Experience_Level == "Experienced" ~ . , data = training_data, distribution = "bernoulli",
+               interaction.depth = 1, shrinkage = 0.001, 
+               n.cores = parallel::detectCores())
+
+summary(boosted)
+
+predictions <- predict(boosted, newdata = testing_data, type = "response", 
+                       n.trees = 100)
+pred_boosting_def <- as.integer(predictions > 0.5)
+
+results <- rbind(results, data.frame(model = "Boosting- additive model with default shrinkage", results = mean((testing_data$Experience_Level == "Experienced") == (pred_boosting_def))))
+kable(table(testing_data$Experience_Level, pred_boosting_def), caption = "Boosting (defaults) Confusion Matrix")
+```
+
+The performance of the model improves on increasing the interaction depth and on increasing the shrinkage
+
+```{r}
+boosted <- gbm(Experience_Level == "Experienced" ~ . , data = training_data, distribution = "bernoulli",
+               interaction.depth = 7, shrinkage = 0.01, 
+               n.cores = parallel::detectCores())
+summary(boosted)
+predictions <- predict(boosted, newdata = testing_data, type = "response", 
+                       n.trees = 100)
+pred_boosting_custom <- as.integer(predictions > 0.5)
+results <- rbind(results, data.frame(model = "Boosting- additive model with default shrinkage", results = mean((testing_data$Experience_Level == "Experienced") == (pred_boosting_custom))))
+kable(table(testing_data$Experience_Level, pred_boosting_custom), caption = "Boosting (customized) Confusion Matrix")
+```
+
+# Neural Network
+
+```{r}
+
+for(units_hl in 1:7){
+  nnet <- nnet(Experience_Level ~ ., data = training_data, size = units_hl, na.action = na.omit)
+  Experience_Level_hat <- predict(nnet, newdata = testing_data, type = "class")
+  results <- rbind(results, data.frame(model = paste("Neural Network, size =", units_hl), results = mean(testing_data$Experience_Level == (Experience_Level_hat))))
+  print(kable(table(testing_data$Experience_Level, Experience_Level_hat)), caption = "Neural Network Confusion Matrix")
+}
+
+```
+
+# Comparing Models
+
+```{r}
+results
+```
+
+Best Model on the correct classification critereon
+
+```{r}
+print(results[which.max(results$results),])
+```
+
+# Conclusion
+
+The subjectivity of the classification is highlighted by the observation that the none of the models could yield more than a 82% success rate. The random forest model performs the best for the defined training dataset. The words _mentor_, _lead_ and _deploy_ appear to be the strongest indicators of an experienced position. 
+
